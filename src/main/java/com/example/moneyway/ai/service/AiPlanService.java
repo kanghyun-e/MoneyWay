@@ -109,6 +109,10 @@ public class AiPlanService {
             accommodationCandidates = placeRepository.findTopAccommodations(Integer.MAX_VALUE);
         }
 
+        if (accommodationCandidates.isEmpty()) {
+            throw new RuntimeException("조건에 맞는 숙소가 없습니다.");
+        }
+
         NearbyPlaceDto chosenAccommodation = accommodationCandidates.get(0);
 
         List<SimplePlaceDto> accommodations = List.of(
@@ -121,11 +125,6 @@ public class AiPlanService {
                         chosenAccommodation.getMapx()
                 )
         );
-
-        if (accommodationCandidates.isEmpty()) {
-
-            throw new RuntimeException("조건에 맞는 숙소가 없습니다.");
-        }
 
         log.info("숙소 후보 개수: {}, 최종 선택: {}",
                 accommodationCandidates.size(),
@@ -228,6 +227,7 @@ public class AiPlanService {
         placesWrapper.put("cafes", cafes);
         placesWrapper.put("accommodations", accommodations);
 
+        Set<Long> allowedPlaceIds = collectAllowedPlaceIds(tours, foods, cafes, accommodations);
         String placeJsonString = mapper.writeValueAsString(placesWrapper);
 
         String template = loadPromptTemplate();
@@ -272,44 +272,33 @@ public class AiPlanService {
             List<AiPlaceDto> fixedPlaces = new ArrayList<>(day.places());
             int dayCost = 0;
 
+            // 후보 목록에 없는 placeId는 후처리 전에 제거해 AI 환각 장소를 차단
+            for (int i = 0; i < fixedPlaces.size(); i++) {
+                AiPlaceDto p = fixedPlaces.get(i);
+                Long placeId = p.placeId();
+                if (placeId == null || placeId == 0L) {
+                    fixedPlaces.set(i, createFreeTimePlace(p.time(), p.categoryName()));
+                    continue;
+                }
+                if (!allowedPlaceIds.contains(placeId)) {
+                    if ("ACCOMMODATION".equals(p.categoryName()) || "숙소".equals(p.time())) {
+                        fixedPlaces.set(i, createAccommodationPlace(accommodations.get(0), p.time()));
+                    } else {
+                        fixedPlaces.set(i, createFreeTimePlace(p.time(), p.categoryName()));
+                    }
+                }
+            }
+
             // 1. 누락된 슬롯 보정
             for (String slot : requiredSlots) {
                 boolean exists = fixedPlaces.stream().anyMatch(p -> slot.equals(p.time()));
                 if (!exists) {
                     if ("숙소".equals(slot)) {
                         SimplePlaceDto acc = accommodations.get(0);
-                        fixedPlaces.add(new AiPlaceDto(
-                                acc.placeId(),
-                                acc.title(),
-                                null,
-                                "ACCOMMODATION",
-                                acc.priceInfo(),
-                                acc.latitude() != null ? String.valueOf(acc.latitude()) : null,
-                                acc.longitude() != null ? String.valueOf(acc.longitude()) : null,
-                                "숙소",
-                                parsePriceInfo(acc.priceInfo()),
-                                getDefaultStartTime("숙소"),
-                                getDefaultEndTime("숙소")
-                        ));
+                        fixedPlaces.add(createAccommodationPlace(acc, "숙소"));
                         usedPlaceIds.add(acc.placeId());
                     } else {
-                        fixedPlaces.add(new AiPlaceDto(
-                                0L,
-                                slot + " 자유시간",
-                                null,
-                                switch (slot) {
-                                    case "점심", "저녁" -> "RESTAURANT";
-                                    case "카페" -> "CAFE";
-                                    default -> "TOURIST_ATTRACTION";
-                                },
-                                "0",
-                                null,
-                                null,
-                                slot,
-                                0,
-                                getDefaultStartTime(slot),
-                                getDefaultEndTime(slot)
-                        ));
+                        fixedPlaces.add(createFreeTimePlace(slot, defaultCategoryName(slot)));
                     }
                 }
             }
@@ -319,19 +308,7 @@ public class AiPlanService {
                 AiPlaceDto p = fixedPlaces.get(i);
                 if ("ACCOMMODATION".equals(p.categoryName()) && p.placeId() == 0L) {
                     SimplePlaceDto acc = accommodations.get(0);
-                    fixedPlaces.set(i, new AiPlaceDto(
-                            acc.placeId(),
-                            acc.title(),
-                            null,
-                            "ACCOMMODATION",
-                            acc.priceInfo(),
-                            acc.latitude() != null ? String.valueOf(acc.latitude()) : null,
-                            acc.longitude() != null ? String.valueOf(acc.longitude()) : null,
-                            p.time(),
-                            parsePriceInfo(acc.priceInfo()),
-                            getDefaultStartTime(p.time()),
-                            getDefaultEndTime(p.time())
-                    ));
+                    fixedPlaces.set(i, createAccommodationPlace(acc, p.time()));
                     usedPlaceIds.add(acc.placeId());
                 }
             }
@@ -490,7 +467,7 @@ public class AiPlanService {
             // 6. 카페 교체
             for (int i = 0; i < fixedPlaces.size(); i++) {
                 AiPlaceDto p = fixedPlaces.get(i);
-                if ("카페".equals(p.time()) && !"CAFE".equals(p.categoryName())) {
+                if ("카페".equals(p.time()) && (p.placeId() == 0L || !"CAFE".equals(p.categoryName()))) {
 
                     int remainingBudget = budget - totalUsedCost;
 
@@ -615,6 +592,69 @@ public class AiPlanService {
             case "저녁" -> "20:00";
             case "숙소" -> "22:00";
             default -> "10:00";
+        };
+    }
+
+    @SafeVarargs
+    private final Set<Long> collectAllowedPlaceIds(List<SimplePlaceDto>... placeGroups) {
+        Set<Long> ids = new HashSet<>();
+        for (List<SimplePlaceDto> group : placeGroups) {
+            for (SimplePlaceDto place : group) {
+                if (place.placeId() != null) {
+                    ids.add(place.placeId());
+                }
+            }
+        }
+        return ids;
+    }
+
+    private AiPlaceDto createAccommodationPlace(SimplePlaceDto accommodation, String slot) {
+        String safeSlot = normalizeSlot(slot);
+        return new AiPlaceDto(
+                accommodation.placeId(),
+                accommodation.title(),
+                null,
+                "ACCOMMODATION",
+                accommodation.priceInfo(),
+                accommodation.latitude() != null ? String.valueOf(accommodation.latitude()) : null,
+                accommodation.longitude() != null ? String.valueOf(accommodation.longitude()) : null,
+                safeSlot,
+                parsePriceInfo(accommodation.priceInfo()),
+                getDefaultStartTime(safeSlot),
+                getDefaultEndTime(safeSlot)
+        );
+    }
+
+    private AiPlaceDto createFreeTimePlace(String slot, String categoryName) {
+        String safeSlot = normalizeSlot(slot);
+        String safeCategory = (categoryName == null || categoryName.isBlank())
+                ? defaultCategoryName(safeSlot)
+                : categoryName;
+        return new AiPlaceDto(
+                0L,
+                safeSlot + " 자유시간",
+                null,
+                safeCategory,
+                "0",
+                null,
+                null,
+                safeSlot,
+                0,
+                getDefaultStartTime(safeSlot),
+                getDefaultEndTime(safeSlot)
+        );
+    }
+
+    private String normalizeSlot(String slot) {
+        return (slot == null || slot.isBlank()) ? "오전" : slot;
+    }
+
+    private String defaultCategoryName(String slot) {
+        return switch (slot) {
+            case "점심", "저녁" -> "RESTAURANT";
+            case "카페" -> "CAFE";
+            case "숙소" -> "ACCOMMODATION";
+            default -> "TOURIST_ATTRACTION";
         };
     }
 
