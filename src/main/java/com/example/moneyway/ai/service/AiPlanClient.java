@@ -68,16 +68,26 @@ public class AiPlanClient {
 
             log.info("Final AI content: {}", content);
 
-            int firstBrace = content.indexOf('{');
-            int lastBrace  = content.lastIndexOf('}');
-            if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
-                content = content.substring(firstBrace, lastBrace + 1);
-            }
+            content = extractValidJsonContent(content);
             log.info("Cleaned AI content: {}", content);
 
-            // JSON 검증
-            new ObjectMapper().readTree(content);
             return content;
         }
+    }
+
+    String extractValidJsonContent(String content) throws Exception {
+        String cleaned = content
+                .replace("```json", "")
+                .replace("```", "")
+                .trim();
+
+        int firstBrace = cleaned.indexOf('{');
+        int lastBrace  = cleaned.lastIndexOf('}');
+        if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
+            cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+        }
+
+        new ObjectMapper().readTree(cleaned);
+        return cleaned;
     }
 }
